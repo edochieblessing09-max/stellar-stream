@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction } from "express";
 import { sendApiError } from "../apiErrors";
+import { logger } from "../logger";
 
 export interface AdminAuthorizedCaller {
   role: "admin";
@@ -49,10 +50,11 @@ function isMalformedKeyFormat(key: string): boolean {
  * for the admin token-exchange endpoint) and records the authorized admin caller
  * on `req.user` when valid.
  */
-export function authorizeAdminApiKey(
+function evaluateAdminApiKey(
   req: Request,
   res: Response,
-  options?: { allowBodyKey?: boolean },
+  options: { allowBodyKey?: boolean } | undefined,
+  deny: (req: Request, res: Response, status: number, message: string, extra: { code: AdminAuthOutcomeCode }) => void,
 ): boolean {
   delete (req as { user?: unknown }).user;
 
@@ -60,7 +62,7 @@ export function authorizeAdminApiKey(
   const configured = typeof configuredRaw === "string" ? configuredRaw.trim() : "";
 
   if (configured.length === 0) {
-    sendApiError(req, res, 401, "Admin API key is not configured on this server.", {
+    deny(req, res, 401, "Admin API key is not configured on this server.", {
       code: "ADMIN_KEY_NOT_CONFIGURED",
     });
     return false;
@@ -69,7 +71,7 @@ export function authorizeAdminApiKey(
   // Reject repeated X-Admin-Key headers whether surfaced as string[] by mocks
   // or folded from multiple entries in Node's req.rawHeaders.
   if (hasDuplicateHeader(req, "X-Admin-Key")) {
-    sendApiError(req, res, 401, "Ambiguous X-Admin-Key header (multiple values).", {
+    deny(req, res, 401, "Ambiguous X-Admin-Key header (multiple values).", {
       code: "ADMIN_KEY_MALFORMED",
     });
     return false;
@@ -92,7 +94,7 @@ export function authorizeAdminApiKey(
     bodyObj.apiKey !== undefined;
 
   if (!hasHeader && !hasBodyKey) {
-    sendApiError(
+    deny(
       req,
       res,
       401,
@@ -107,7 +109,7 @@ export function authorizeAdminApiKey(
   let trimmedHeader: string | undefined;
   if (hasHeader) {
     if (typeof rawHeader !== "string") {
-      sendApiError(req, res, 401, "Malformed X-Admin-Key header.", {
+      deny(req, res, 401, "Malformed X-Admin-Key header.", {
         code: "ADMIN_KEY_MALFORMED",
       });
       return false;
@@ -115,14 +117,14 @@ export function authorizeAdminApiKey(
 
     trimmedHeader = rawHeader.trim();
     if (trimmedHeader.length === 0) {
-      sendApiError(req, res, 401, "Empty X-Admin-Key header.", {
+      deny(req, res, 401, "Empty X-Admin-Key header.", {
         code: "ADMIN_KEY_MALFORMED",
       });
       return false;
     }
 
     if (isMalformedKeyFormat(trimmedHeader)) {
-      sendApiError(req, res, 401, "Malformed X-Admin-Key header.", {
+      deny(req, res, 401, "Malformed X-Admin-Key header.", {
         code: "ADMIN_KEY_MALFORMED",
       });
       return false;
@@ -133,7 +135,7 @@ export function authorizeAdminApiKey(
   if (hasBodyKey) {
     const rawBodyKey = bodyObj!.apiKey;
     if (typeof rawBodyKey !== "string") {
-      sendApiError(req, res, 401, "Malformed Admin API key.", {
+      deny(req, res, 401, "Malformed Admin API key.", {
         code: "ADMIN_KEY_MALFORMED",
       });
       return false;
@@ -141,14 +143,14 @@ export function authorizeAdminApiKey(
 
     trimmedBody = rawBodyKey.trim();
     if (trimmedBody.length === 0) {
-      sendApiError(req, res, 401, "Empty Admin API key.", {
+      deny(req, res, 401, "Empty Admin API key.", {
         code: "ADMIN_KEY_MALFORMED",
       });
       return false;
     }
 
     if (isMalformedKeyFormat(trimmedBody)) {
-      sendApiError(req, res, 401, "Malformed Admin API key.", {
+      deny(req, res, 401, "Malformed Admin API key.", {
         code: "ADMIN_KEY_MALFORMED",
       });
       return false;
@@ -156,7 +158,7 @@ export function authorizeAdminApiKey(
   }
 
   if (trimmedHeader !== undefined && trimmedBody !== undefined && trimmedHeader !== trimmedBody) {
-    sendApiError(req, res, 401, "Conflicting Admin API key in header and body.", {
+    deny(req, res, 401, "Conflicting Admin API key in header and body.", {
       code: "ADMIN_KEY_MALFORMED",
     });
     return false;
@@ -165,7 +167,7 @@ export function authorizeAdminApiKey(
   const key = (trimmedHeader ?? trimmedBody)!;
 
   if (key !== configured) {
-    sendApiError(req, res, 401, "Invalid Admin API key.", {
+    deny(req, res, 401, "Invalid Admin API key.", {
       code: "ADMIN_KEY_INVALID",
     });
     return false;
@@ -175,6 +177,66 @@ export function authorizeAdminApiKey(
   return true;
 }
 
+export type AdminAuthOutcomeCode =
+  | "ADMIN_KEY_NOT_CONFIGURED"
+  | "ADMIN_KEY_MALFORMED"
+  | "ADMIN_KEY_MISSING"
+  | "ADMIN_KEY_INVALID";
+
+/**
+ * Validates the Admin API key from `X-Admin-Key` (and optionally `req.body.apiKey`
+ * for the admin token-exchange endpoint) and records the authorized admin caller
+ * on `req.user` when valid.
+ *
+ * Emits one structured `admin_auth` log line per attempt with the outcome,
+ * rejection code, latency, and request/correlation/stream IDs so operators can
+ * tell an expected rejection (missing/malformed/invalid key, `warn`) from a
+ * server misconfiguration (`ADMIN_KEY_NOT_CONFIGURED`, `error`) and from success
+ * (`info`), including requests racing a key rotation. The key value, its length,
+ * and any derivative of it are never logged.
+ */
+export function authorizeAdminApiKey(
+  req: Request,
+  res: Response,
+  options?: { allowBodyKey?: boolean },
+): boolean {
+  const startedAt = process.hrtime.bigint();
+  let rejectionCode: AdminAuthOutcomeCode | undefined;
+
+  const deny = (
+    r: Request,
+    s: Response,
+    status: number,
+    message: string,
+    extra: { code: AdminAuthOutcomeCode },
+  ) => {
+    rejectionCode = extra.code;
+    sendApiError(r, s, status, message, extra);
+  };
+
+  const authorized = evaluateAdminApiKey(req, res, options, deny);
+  const latencyMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+  const streamId = (req.params as Record<string, string> | undefined)?.id;
+  const fields = {
+    event: "admin_auth",
+    outcome: authorized ? "authorized" : "rejected",
+    code: authorized ? undefined : rejectionCode,
+    latencyMs,
+    method: req.method,
+    path: req.path,
+    requestId: req.requestId,
+    correlationId: req.correlationId,
+    streamId,
+  };
+  if (authorized) {
+    logger.info(fields, "admin API key authorized");
+  } else if (rejectionCode === "ADMIN_KEY_NOT_CONFIGURED") {
+    logger.error(fields, "admin API key rejected: server misconfigured");
+  } else {
+    logger.warn(fields, "admin API key rejected");
+  }
+  return authorized;
+}
 /**
  * Admin API key authentication middleware.
  *
